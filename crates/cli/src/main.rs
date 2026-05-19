@@ -66,7 +66,10 @@ fn initialize_logger(cli: &Cli) -> Result<()> {
     let filter = if silent {
         simplelog::LevelFilter::Off
     } else if cli.debug {
-        simplelog::LevelFilter::Debug
+        // Trace so hyper's wire-level request/response logs surface
+        // (request headers, status line). simplelog ignores RUST_LOG,
+        // so this is the only knob.
+        simplelog::LevelFilter::Trace
     } else {
         simplelog::LevelFilter::Info
     };

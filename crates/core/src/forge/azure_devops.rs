@@ -119,7 +119,14 @@ impl AzureDevops {
         // Azure DevOps accepts either a PAT (Basic base64(":{PAT}")) or an
         // OAuth bearer (typically a pipeline System.AccessToken, which is a
         // signed JWT). Detect the JWT shape to pick the scheme.
-        let token_value = if looks_like_jwt(token.expose_secret()) {
+        let is_jwt = looks_like_jwt(token.expose_secret());
+        log::debug!(
+            "azure-devops auth: scheme={} token_len={} jwt_detected={}",
+            if is_jwt { "Bearer" } else { "Basic" },
+            token.expose_secret().len(),
+            is_jwt,
+        );
+        let token_value = if is_jwt {
             HeaderValue::from_str(&format!("Bearer {}", token.expose_secret()))?
         } else {
             let basic = BASE64_STANDARD
@@ -460,6 +467,12 @@ fn normalize_path(path: &str) -> String {
 async fn read_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T> {
+    log::debug!(
+        "azure-devops response: url={} status={} content-type={:?}",
+        response.url(),
+        response.status(),
+        response.headers().get(reqwest::header::CONTENT_TYPE),
+    );
     let response = response.error_for_status()?;
     let status = response.status();
     let url = response.url().clone();

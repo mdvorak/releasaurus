@@ -71,9 +71,17 @@ fn initialize_logger(cli: &Cli) -> Result<()> {
         simplelog::LevelFilter::Info
     };
 
-    let config = simplelog::ConfigBuilder::new()
-        .add_filter_allow_str("releasaurus")
-        .build();
+    let mut config_builder = simplelog::ConfigBuilder::new();
+    config_builder.add_filter_allow_str("releasaurus");
+    if cli.debug {
+        // Surface HTTP transport logs when debugging forge auth/transport
+        // issues. Off at INFO to keep normal runs quiet.
+        config_builder.add_filter_allow_str("reqwest");
+        config_builder.add_filter_allow_str("hyper");
+        config_builder.add_filter_allow_str("hyper_util");
+        config_builder.add_filter_allow_str("rustls");
+    }
+    let config = config_builder.build();
 
     simplelog::TermLogger::init(
         filter,

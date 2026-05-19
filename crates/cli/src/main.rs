@@ -16,7 +16,7 @@
 
 use clap::Parser;
 use color_eyre::eyre::Result;
-use releasaurus::cli::{Cli, Command, GetCommand, get};
+use releasaurus::cli::{Cli, Command, DebugLevel, GetCommand, get};
 use releasaurus_core::config::resolved::PackageOverrides;
 use releasaurus_core::forge::manager::{ForgeManager, ForgeOptions};
 use releasaurus_core::orchestrator::Orchestrator;
@@ -65,18 +65,17 @@ fn initialize_logger(cli: &Cli) -> Result<()> {
 
     let filter = if silent {
         simplelog::LevelFilter::Off
-    } else if cli.debug {
-        // Trace so hyper's wire-level request/response logs surface
-        // (request headers, status line). simplelog ignores RUST_LOG,
-        // so this is the only knob.
-        simplelog::LevelFilter::Trace
     } else {
-        simplelog::LevelFilter::Info
+        match cli.debug {
+            Some(DebugLevel::Trace) => simplelog::LevelFilter::Trace,
+            Some(DebugLevel::Debug) => simplelog::LevelFilter::Debug,
+            None => simplelog::LevelFilter::Info,
+        }
     };
 
     let mut config_builder = simplelog::ConfigBuilder::new();
     config_builder.add_filter_allow_str("releasaurus");
-    if cli.debug {
+    if cli.debug.is_some() {
         // Surface HTTP transport logs when debugging forge auth/transport
         // issues. Off at INFO to keep normal runs quiet.
         config_builder.add_filter_allow_str("reqwest");
@@ -173,13 +172,13 @@ async fn main() -> Result<()> {
     let mut cli = Cli::parse();
 
     if std::env::var(DEBUG_ENV_VAR).is_ok() {
-        cli.debug = true;
+        cli.debug = cli.debug.or(Some(DebugLevel::Debug));
     }
 
     let dry_run = get_dry_run_value(&cli);
 
     if dry_run {
-        cli.debug = true;
+        cli.debug = cli.debug.or(Some(DebugLevel::Debug));
     }
 
     initialize_logger(&cli)?;

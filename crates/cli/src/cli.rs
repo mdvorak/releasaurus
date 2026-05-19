@@ -32,6 +32,15 @@ use std::{
 
 pub mod get;
 
+/// Verbosity level passed to `--debug`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DebugLevel {
+    /// Debug logging (transport-level HTTP, includes redirect chain).
+    Debug,
+    /// Trace logging (very verbose, includes request/response headers).
+    Trace,
+}
+
 /// Global CLI arguments for forge configuration and debugging.
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -39,9 +48,16 @@ pub struct Cli {
     #[command(flatten)]
     pub forge_args: ForgeArgs,
 
-    /// Enable debug logging
-    #[arg(long, default_value_t = false, global = true)]
-    pub debug: bool,
+    /// Enable verbose logging. Pass bare (`--debug`) for debug level
+    /// or `--debug=trace` for trace-level HTTP wire logs.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "debug",
+        global = true,
+    )]
+    pub debug: Option<DebugLevel>,
 
     /// Base branch for releases. Defaults to repository's default branch
     #[arg(long, global = true)]

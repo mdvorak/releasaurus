@@ -35,7 +35,7 @@ use crate::{
             AzurePullRequest, AzureRef, AzureRepo, Change, ChangeItem,
             CreateLabel, CreatePullRequest, NewContent, PullRequestQuery,
             PullRequestQueryInput, PullRequestQueryResponse, Push, PushCommit,
-            PushResponse, RefUpdate, UpdatePullRequest,
+            PushResponse, RefUpdate, RefUpdateResult, UpdatePullRequest,
         },
         config::{
             DEFAULT_PAGE_SIZE, PENDING_LABEL, RepoUrl, TokenVar, USER_AGENT,
@@ -294,6 +294,31 @@ impl AzureDevops {
             })
     }
 
+    /// Applies `updates` through the Refs API.
+    ///
+    /// Azure DevOps answers HTTP 200 even when it refuses an update, such
+    /// as moving a branch backwards without Force push permission, and
+    /// reports the refusal per ref; any refused ref is an error naming its
+    /// status.
+    async fn update_refs(&self, updates: &[RefUpdate]) -> Result<()> {
+        let url = self.endpoint("refs")?;
+        let response = self.client.post(url).json(updates).send().await?;
+        let results: AzureList<RefUpdateResult> = read_json(response).await?;
+        let refused = results
+            .value
+            .iter()
+            .filter(|result| !result.success)
+            .map(describe_refused_ref)
+            .collect::<Vec<_>>();
+        if refused.is_empty() {
+            return Ok(());
+        }
+        Err(ReleasaurusError::forge(format!(
+            "Azure DevOps refused to update {}",
+            refused.join("; ")
+        )))
+    }
+
     async fn build_push_changes(
         &self,
         changes: &[ResolvedFileChange],
@@ -514,6 +539,38 @@ async fn read_json<T: serde::de::DeserializeOwned>(
              invalid or lack access to this repository"
         ))
     })
+}
+
+/// One refused ref for an error message: its name, status, the reason
+/// Azure DevOps gave, and a hint for the statuses a token's permissions
+/// explain.
+fn describe_refused_ref(result: &RefUpdateResult) -> String {
+    let mut description = format!("{} ({})", result.name, result.update_status);
+    if let Some(message) = result.custom_message.as_deref()
+        && !message.is_empty()
+    {
+        description.push_str(&format!(": {message}"));
+    }
+    if let Some(plugin) = result.rejected_by.as_deref()
+        && !plugin.is_empty()
+    {
+        description.push_str(&format!(", rejected by {plugin}"));
+    }
+    let hint = match result.update_status.as_str() {
+        "forcePushRequired" => {
+            " — resetting it drops commits, which needs Force push \
+             permission on it for the token's identity; Azure DevOps grants \
+             that to a branch's creator, so a branch created by another \
+             identity, such as a pipeline, needs it granted"
+        }
+        status if status.ends_with("PermissionRequired") => {
+            " — the token's identity lacks this permission on the repository"
+        }
+        "staleOldObjectId" => " — the ref moved during the update; run again",
+        _ => "",
+    };
+    description.push_str(hint);
+    description
 }
 
 /// Returns `true` if `token` has the structural shape of a JWT (RFC 7519):
@@ -810,18 +867,12 @@ impl Forge for AzureDevops {
             self.get_branch_head_sha(&req.release_branch).await.ok();
         let old_object_id =
             existing_sha.as_deref().unwrap_or(ZERO_SHA).to_string();
-        let url = self.endpoint("refs")?;
-        let body = vec![RefUpdate {
+        self.update_refs(&[RefUpdate {
             name: format!("refs/heads/{}", req.release_branch),
             old_object_id,
             new_object_id: Some(base_sha.clone()),
-        }];
-        self.client
-            .post(url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
+        }])
+        .await?;
         let changes = self.build_push_changes(&req.file_changes).await?;
         let new_sha = self
             .push_to_branch(
@@ -852,15 +903,12 @@ impl Forge for AzureDevops {
     }
 
     async fn tag_commit(&self, tag_name: &str, sha: &str) -> Result<()> {
-        let url = self.endpoint("refs")?;
-        let body = vec![RefUpdate {
+        self.update_refs(&[RefUpdate {
             name: format!("refs/tags/{tag_name}"),
             old_object_id: ZERO_SHA.to_string(),
             new_object_id: Some(sha.to_string()),
-        }];
-        let response = self.client.post(url).json(&body).send().await?;
-        response.error_for_status()?;
-        Ok(())
+        }])
+        .await
     }
 
     async fn get_tag(&self, tag_name: &str) -> Result<Option<TagResponse>> {
@@ -1653,5 +1701,151 @@ mod tests {
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].sha, "commit-sha");
         assert!(tags[0].timestamp.is_some());
+    }
+
+    /// Mounts the head lookup for `branch`, pointing it at `sha`.
+    async fn mount_branch_head(server: &MockServer, branch: &str, sha: &str) {
+        Mock::given(method("GET"))
+            .and(path(api_path("refs")))
+            .and(query_param("filter", format!("heads/{branch}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "count": 1,
+                    "value": [{
+                        "name": format!("refs/heads/{branch}"),
+                        "objectId": sha,
+                    }]
+                }),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    /// Mounts a Refs API update answering HTTP 200 with `result` for its
+    /// one ref, as Azure DevOps does whether or not it applied the update.
+    async fn mount_ref_update(
+        server: &MockServer,
+        request: serde_json::Value,
+        result: serde_json::Value,
+    ) {
+        Mock::given(method("POST"))
+            .and(path(api_path("refs")))
+            .and(body_json(request))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "count": 1, "value": [result] }),
+            ))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn create_release_branch_fails_when_azure_refuses_the_reset() {
+        let server = MockServer::start().await;
+        let azure = make_azure(&server).await;
+        mount_branch_head(&server, "main", "base-sha").await;
+        mount_branch_head(&server, "releasaurus-release-main", "old-sha").await;
+        mount_ref_update(
+            &server,
+            serde_json::json!([{
+                "name": "refs/heads/releasaurus-release-main",
+                "oldObjectId": "old-sha",
+                "newObjectId": "base-sha",
+            }]),
+            serde_json::json!({
+                "name": "refs/heads/releasaurus-release-main",
+                "oldObjectId": "old-sha",
+                "newObjectId": "base-sha",
+                "success": false,
+                "updateStatus": "forcePushRequired",
+            }),
+        )
+        .await;
+        // nothing is pushed onto a branch that was not reset
+        Mock::given(method("POST"))
+            .and(path(api_path("pushes")))
+            .respond_with(ResponseTemplate::new(409))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let result = azure
+            .create_release_branch(ResolvedCreateReleaseBranchRequest {
+                base_branch: "main".into(),
+                release_branch: "releasaurus-release-main".into(),
+                message: "chore(main): release".into(),
+                file_changes: vec![],
+            })
+            .await;
+
+        let Err(ReleasaurusError::ForgeError(message)) = result else {
+            panic!("expected a forge error, got {result:?}");
+        };
+        assert!(
+            message.starts_with(
+                "Azure DevOps refused to update \
+                 refs/heads/releasaurus-release-main (forcePushRequired)"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("Force push permission"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn tag_commit_fails_when_azure_refuses_the_tag() {
+        let server = MockServer::start().await;
+        let azure = make_azure(&server).await;
+        mount_ref_update(
+            &server,
+            serde_json::json!([{
+                "name": "refs/tags/v1.0.0",
+                "oldObjectId": ZERO_SHA,
+                "newObjectId": SHA,
+            }]),
+            serde_json::json!({
+                "name": "refs/tags/v1.0.0",
+                "success": false,
+                "updateStatus": "createTagPermissionRequired",
+                "customMessage": "TF401027: You need the Git 'CreateTag' \
+                                  permission to perform this action.",
+            }),
+        )
+        .await;
+
+        let result = azure.tag_commit("v1.0.0", SHA).await;
+
+        let Err(ReleasaurusError::ForgeError(message)) = result else {
+            panic!("expected a forge error, got {result:?}");
+        };
+        assert!(
+            message.starts_with(
+                "Azure DevOps refused to update refs/tags/v1.0.0 \
+                 (createTagPermissionRequired): TF401027:"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("lacks this permission"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn tag_commit_succeeds_when_azure_applies_the_update() {
+        let server = MockServer::start().await;
+        let azure = make_azure(&server).await;
+        mount_ref_update(
+            &server,
+            serde_json::json!([{
+                "name": "refs/tags/v1.0.0",
+                "oldObjectId": ZERO_SHA,
+                "newObjectId": SHA,
+            }]),
+            serde_json::json!({
+                "name": "refs/tags/v1.0.0",
+                "success": true,
+                "updateStatus": "succeeded",
+            }),
+        )
+        .await;
+
+        azure.tag_commit("v1.0.0", SHA).await.unwrap();
     }
 }

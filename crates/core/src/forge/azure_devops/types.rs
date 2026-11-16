@@ -46,6 +46,26 @@ pub struct RefUpdate {
     pub new_object_id: Option<String>,
 }
 
+/// Outcome of one ref update from the Refs API, which reports a refused
+/// update here rather than through the HTTP status.
+#[derive(Debug, Deserialize)]
+pub struct RefUpdateResult {
+    /// Fully-qualified ref name the update targeted.
+    pub name: String,
+    /// Whether Azure DevOps applied the update.
+    pub success: bool,
+    /// Why the update was or was not applied, such as `succeeded` or
+    /// `forcePushRequired`.
+    #[serde(rename = "updateStatus", default)]
+    pub update_status: String,
+    /// Reason for a failure, when Azure DevOps gives one.
+    #[serde(rename = "customMessage", default)]
+    pub custom_message: Option<String>,
+    /// Name of the plugin that rejected the update, if one did.
+    #[serde(rename = "rejectedBy", default)]
+    pub rejected_by: Option<String>,
+}
+
 /// Author or committer information attached to an Azure DevOps commit.
 #[derive(Debug, Default, Deserialize)]
 pub struct AzureUser {
